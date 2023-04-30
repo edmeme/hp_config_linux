@@ -1,0 +1,4 @@
+The printer seems to dislike ports in the host section
+Interestingly, it seems to respond with a random file when using
+> curl http://localhost:8102/ -H "Host: localhost:1234" --verbose
+            
