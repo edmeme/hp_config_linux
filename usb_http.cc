@@ -7,17 +7,30 @@
 
 #include <fmt/format.h>
 
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <signal.h>
+
 struct candidate_ifc {
   libusb_device_handle * handle;
   int interface;
   int altsetting;
 };
 
+using proto_handler = void(const std::vector<char> & request,
+                             std::vector<char> & response);
+
 const uint16_t VID = 0x03f0;
 const uint16_t PID = 0xbe2a;
 
-void die(const std::string & fmts){
-  fmt::print("{}", fmts);
+static bool g_interrupted = false;
+
+static void sigkill(int s){
+  g_interrupted = true;
+}
+
+static void die(const std::string & fmts){
+  fmt::print("{}\n", fmts);
   exit(1);
 }
 
@@ -49,10 +62,81 @@ static void display_buffer_hex(unsigned char *buffer, unsigned size)
   printf("\n" );
 }
 
+
+static bool read_http_request(int connfd, std::vector<char> & client_buffer) {
+  const size_t READ_SZ = 1024;
+  client_buffer.resize(0);
+  ssize_t read = 0;
+  do{
+    auto pre_sz = client_buffer.size();
+    client_buffer.resize(pre_sz + READ_SZ);
+    read = recv(connfd, &client_buffer[pre_sz], READ_SZ, 0);
+    if(read > 0)
+      client_buffer.resize(pre_sz + read);
+    if (read < 0)
+      return false;
+  } while(read == READ_SZ);
+  return true;
+}
+
+static void server(short port, proto_handler & handler) {
+  struct sockaddr_in servaddr, cli;
+
+  std::vector<char> client_buffer;
+  std::vector<char> response_buffer;
+
+  signal(SIGKILL, sigkill);
+  
+  // socket create and verification
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (sockfd == -1)
+    die("failed to create socket\n");
+
+  const int enable = 1;
+  if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(int)) < 0)
+    die("failed to set SO_REUSEADDR\n");
+  
+  memset(&servaddr, 0, sizeof(servaddr));
+  servaddr.sin_family = AF_INET;
+  servaddr.sin_addr.s_addr = htonl(INADDR_ANY);
+  servaddr.sin_port = htons(port);
+  
+  if ((bind(sockfd, (sockaddr*) &servaddr, sizeof(servaddr))) != 0) 
+    die("bind failed\n");
+  
+  // Now server is ready to listen and verification
+  if ((listen(sockfd, 5)) != 0)
+    die("listen failed");
+
+  fmt::print("Now listening on http://localhost:{}/\n",port);
+  
+  while(!g_interrupted){
+    unsigned len = sizeof(cli);
+    int connfd = accept(sockfd, (sockaddr*)&cli, &len);
+    if (connfd < 0) {
+      perror("accept failed");
+    }
+    fmt::print("Connection accepted\n");
+
+    bool connected = true;
+    while(connected){
+      connected = read_http_request(connfd, client_buffer);
+      fmt::print("got {} bytes from client.", client_buffer.size());
+      display_buffer_hex((unsigned char *)client_buffer.data(),client_buffer.size());
+      handler(client_buffer, response_buffer);
+      fmt::print("responding with {}.", response_buffer.size());
+      display_buffer_hex((unsigned char *)response_buffer.data(),response_buffer.size());
+      connected = connected and (send(connfd, response_buffer.data(), response_buffer.size(), 0) > 1);
+    }
+  }
+  close(sockfd);
+  signal(SIGKILL, nullptr);
+}
+
 static int poke(libusb_device_handle *handle)
 {
   unsigned char buffer[1024*16];
-  unsigned char request[] = ("GET /DevMgmt/DiscoveryTree.xml HTTP/1.1"
+  unsigned char request[] = ("GET / HTTP/1.1"
                              "\x0d\x0a"
                              "HOST: localhost"
                              "\x0d\x0a"
@@ -283,7 +367,25 @@ static int test_device(uint16_t vid, uint16_t pid)
   return 0;
 }
 
+void h(const std::vector<char> & request,
+       std::vector<char> & response) {
+  response.resize(0);
+  std::string rsp = ("HTTP/1.1 200 OK"
+                     "\x0d\x0a"
+                     "Content-Type: text/html"
+                     "\x0d\x0a"
+                     "Content-Length: 11"
+                     "\x0d\x0a"
+                     "\x0d\x0a"
+                     "hello peeps");
+  for(auto c : rsp) response.push_back(c);
+}
+
+
 int main() {
+  server(8818, h);
+  return 0;
+  
   putenv("LIBUSB_DEBUG=3");
   
   auto version = libusb_get_version();
