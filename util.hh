@@ -21,8 +21,9 @@ static void _die(const std::source_location & s, fmt::format_string<T...> fmt, T
 
 #define die(fmt, ...) (_die(std::source_location::current(), fmt __VA_OPT__(,) __VA_ARGS__ ))
 
-static void display_buffer_hex(unsigned char *buffer, unsigned size, unsigned limit=128)
+static void display_buffer_hex(void *vbuffer, unsigned size, unsigned limit=128)
 {
+  unsigned char * buffer = (unsigned char *)vbuffer;
   unsigned i, j, k;
   
   for (i=0; i<size; i+=16) {

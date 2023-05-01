@@ -26,45 +26,57 @@ struct candidate_ifc {
 const uint16_t VID = 0x03f0;
 const uint16_t PID = 0xbe2a;
 
-static int poke(libusb_device_handle *handle
-                , const std::vector<char> & request
-                , std::vector<char> & response)
+
+struct client_handler
 {
-  int size = 0;
-  int out_ep = 0x03;
-  int in_ep = 0x84;
+  libusb_device_handle * handle;
+  long idle_count = 0;
+
+  client_handler(libusb_device_handle * handle) : handle(handle) {}
   
-  int r = libusb_bulk_transfer(handle, out_ep, (unsigned char *) request.data(), request.size(), &size, 1000);
-  if (r == LIBUSB_ERROR_PIPE) {
-    fmt::print("transfer request failed\n");
-    libusb_clear_halt(handle, out_ep);
-    return 1;
+  bool on_request(const std::vector<char> & request){
+    const int out_ep = 0x03;
+    int size = 0;
+    int r = libusb_bulk_transfer(handle
+                                 , out_ep
+                                 , (unsigned char *) request.data()
+                                 , request.size(), &size, 1000);
+    if (r == LIBUSB_ERROR_PIPE) {
+      fmt::print("transfer request failed\n");
+      libusb_clear_halt(handle, out_ep);
+      return false;
+    }
+    return true;
+    idle_count = 0;
   }
 
-  fmt::print("successfully sent {} bytes of {}, fetching response...\n", size, request.size());
-
-  const size_t READ_SZ = 1024;
-  response.clear();
-  do{
-    size = 0;
-    auto pre_sz = response.size();
-    response.resize(pre_sz + READ_SZ);
-
-    r = libusb_bulk_transfer(handle, in_ep
-                             ,(unsigned char *) &response[pre_sz], READ_SZ
-                             , &size
-                             , 1000);
+  bool on_idle(std::vector<char> & out){
+    const int in_ep = 0x84;
+    int size = 0;
+    out.resize(16*1024);
+    int r = libusb_bulk_transfer(handle
+                                 ,in_ep
+                                 ,(unsigned char *) &out[0]
+                                 , out.size(), &size, 1000);
     if (r == LIBUSB_ERROR_PIPE) {
       fmt::print("transfer request failed\n");
       libusb_clear_halt(handle, in_ep);
-      return 1;
+      return false;
     }
-    fmt::print("successfully read {} bytes:\n", size);
-  } while(size == READ_SZ or response.empty());
-
-  return 0;
-}
-
+    out.resize(size);
+    if(size == 0){
+      idle_count++;
+      if (idle_count > 50){
+        idle_count = 0;
+        fmt::print("Hack!\n");
+        return false;
+      }
+    }else{
+      idle_count = 0;
+    }
+    return true;
+  }
+};
 
 static void print_device_info(libusb_device_handle * handle) {
   struct libusb_config_descriptor *conf_desc;
@@ -140,7 +152,6 @@ static std::vector<candidate_ifc> find_candidate_interfaces(libusb_device_handle
   
   auto n_ifaces = conf_desc->bNumInterfaces;
   for (auto interface : std::span{conf_desc->interface, n_ifaces}) {
-    int id = interface.altsetting[0].bInterfaceNumber;
     for (auto altsetting : std::span{interface.altsetting, (size_t)interface.num_altsetting}) {
       int aid = altsetting.bAlternateSetting;
       bool has_bulk_03 = false;
@@ -177,7 +188,6 @@ static std::vector<candidate_ifc> find_candidate_interfaces(libusb_device_handle
 
 static int test_device(uint16_t vid, uint16_t pid)
 {
-  
   libusb_device_handle *handle;
   int r;
   
@@ -207,11 +217,19 @@ static int test_device(uint16_t vid, uint16_t pid)
   if (r != LIBUSB_SUCCESS) {
     die("Failed to claim usb interface.");
   }
-  
-  server(8102,
-         [handle](const std::vector<char> & request, std::vector<char> & response) {
-           return 0 == poke(handle, request, response);
-         });
+
+
+  client_handler ch(handle);  
+  server(8818,
+         [](const std::vector<char> & request, void * p){
+           return ((client_handler*)p) -> on_request(request);
+         }
+         ,
+         [](std::vector<char> & out, void * p){
+           return ((client_handler*)p) -> on_idle(out);
+         }
+         ,
+         &ch);
   
   
   fmt::print("\n");
