@@ -97,7 +97,6 @@ static bool read_http_request(int connfd, std::vector<char> & client_buffer) {
 }
 
 static void simplify_http_request(std::vector<char> & req) {
-  auto e = end(req);
   auto wanted_host = "\x0d\x0aHost: localhost"sv;
   auto host_start = std::ranges::search(req, "\x0d\x0aHost: "sv);
   auto host_end = std::ranges::search(host_start.next(), "\x0d\x0a"sv);
@@ -205,33 +204,13 @@ static int poke(libusb_device_handle *handle
   return 0;
 }
 
-static int test_device(uint16_t vid, uint16_t pid)
-{
-  std::vector<candidate_ifc> candidates;
-  
-  libusb_device_handle *handle;
-  libusb_device *dev;
-  uint8_t bus, port_path[8];
-  struct libusb_bos_descriptor *bos_desc;
+
+static void print_device_info(libusb_device_handle * handle) {
   struct libusb_config_descriptor *conf_desc;
   const struct libusb_endpoint_descriptor *endpoint;
-  int r;
-  int iface, nb_ifaces, first_iface = -1;
   struct libusb_device_descriptor dev_desc;
-  const char* const speed_name[6] = { "Unknown", "1.5 Mbit/s (USB LowSpeed)", "12 Mbit/s (USB FullSpeed)",
-                                      "480 Mbit/s (USB HighSpeed)", "5000 Mbit/s (USB SuperSpeed)", "10000 Mbit/s (USB SuperSpeedPlus)" };
-  char string[128];
-  uint8_t endpoint_in = 0, endpoint_out = 0;	// default IN and OUT endpoints
-  
-  fmt::print("Opening device {:04X}:{:04X}...\n", vid, pid);
-  handle = libusb_open_device_with_vid_pid(NULL, vid, pid);  
-  if (handle == NULL) {
-    die("Failed to open usb device.");
-    return -1;
-  }
 
-  dev = libusb_get_device(handle);
-
+  auto dev = libusb_get_device(handle);
   fmt::print("\nReading device descriptor:\n");
   libusb_get_device_descriptor(dev, &dev_desc);
 
@@ -252,21 +231,18 @@ static int test_device(uint16_t vid, uint16_t pid)
   print_descriptor("serial number", dev_desc.iSerialNumber);
 
   libusb_get_config_descriptor(dev, 0, &conf_desc);
-  nb_ifaces = conf_desc->bNumInterfaces;
-  if (nb_ifaces > 0){
-    fmt::print("{} interfaces found:\n", nb_ifaces);
-    first_iface = conf_desc->interface[0].altsetting[0].bInterfaceNumber;
+  auto n_ifaces = conf_desc->bNumInterfaces;
+  if (n_ifaces > 0){
+    fmt::print("{} interfaces found:\n", n_ifaces);
   } else {
-    fmt::print("No interfaces found!\n", nb_ifaces);
+    fmt::print("No interfaces found!\n", n_ifaces);
   }
 
-  for (auto interface : std::span{conf_desc->interface, nb_ifaces}) {
+  for (auto interface : std::span{conf_desc->interface, n_ifaces}) {
     int id = interface.altsetting[0].bInterfaceNumber;
     fmt::print(" - interface {}\n", id);
-    for (auto altsetting : std::span{interface.altsetting, interface.num_altsetting}) {
+    for (auto altsetting : std::span{interface.altsetting, (size_t)interface.num_altsetting}) {
       int aid = altsetting.bAlternateSetting;
-      bool has_bulk_03 = false;
-      bool has_bulk_84 = false;
       fmt::print("   - altsetting {}\n", aid);
       fmt::print("     Class.SubClass.Protocol: {:02X}.{:02X}.{:02X}\n",
              altsetting.bInterfaceClass,
@@ -277,24 +253,6 @@ static int test_device(uint16_t vid, uint16_t pid)
         struct libusb_ss_endpoint_companion_descriptor *ep_comp = NULL;
         endpoint = &altsetting.endpoint[k];
         fmt::print("     - endpoint {:02X}\n", endpoint->bEndpointAddress);
-        // Use the first interrupt or bulk IN/OUT endpoints as default for testing
-        if ((endpoint->bmAttributes & LIBUSB_TRANSFER_TYPE_MASK) & (LIBUSB_TRANSFER_TYPE_BULK | LIBUSB_TRANSFER_TYPE_INTERRUPT)) {
-          if (endpoint->bEndpointAddress & LIBUSB_ENDPOINT_IN) {
-            if (!endpoint_in)
-              endpoint_in = endpoint->bEndpointAddress;
-          } else {
-            if (!endpoint_out)
-              endpoint_out = endpoint->bEndpointAddress;
-          }
-        }
-        if (endpoint->bEndpointAddress == 0x03
-            and endpoint->bmAttributes & 2){
-          has_bulk_03 = true;
-        }
-        if (endpoint->bEndpointAddress == 0x84
-            and endpoint->bmAttributes & 2){
-          has_bulk_84 = true;
-        }
         fmt::print("          max packet size: {:04X}\n", endpoint->wMaxPacketSize);
         fmt::print("          polling interval: {:02X}\n", endpoint->bInterval);
         libusb_get_ss_endpoint_companion_descriptor(NULL, endpoint, &ep_comp);
@@ -304,23 +262,81 @@ static int test_device(uint16_t vid, uint16_t pid)
           libusb_free_ss_endpoint_companion_descriptor(ep_comp);
         }
       }
+    }
+  }
+  libusb_free_config_descriptor(conf_desc);
+}
+
+static std::vector<candidate_ifc> find_candidate_interfaces(libusb_device_handle * handle) {
+  std::vector<candidate_ifc> candidates;
+  struct libusb_config_descriptor *conf_desc;
+  const struct libusb_endpoint_descriptor *endpoint;
+  struct libusb_device_descriptor dev_desc;
+
+  auto dev = libusb_get_device(handle);
+  libusb_get_device_descriptor(dev, &dev_desc);
+  libusb_get_config_descriptor(dev, 0, &conf_desc);
+  
+  auto n_ifaces = conf_desc->bNumInterfaces;
+  for (auto interface : std::span{conf_desc->interface, n_ifaces}) {
+    int id = interface.altsetting[0].bInterfaceNumber;
+    for (auto altsetting : std::span{interface.altsetting, (size_t)interface.num_altsetting}) {
+      int aid = altsetting.bAlternateSetting;
+      bool has_bulk_03 = false;
+      bool has_bulk_84 = false;
+      
+      for (int k=0; k<altsetting.bNumEndpoints; k++) {
+        struct libusb_ss_endpoint_companion_descriptor *ep_comp = NULL;
+        endpoint = &altsetting.endpoint[k];
+        if (endpoint->bEndpointAddress == 0x03
+            and endpoint->bmAttributes & 2){
+          has_bulk_03 = true;
+        }
+        if (endpoint->bEndpointAddress == 0x84
+            and endpoint->bmAttributes & 2){
+          has_bulk_84 = true;
+        }
+        libusb_get_ss_endpoint_companion_descriptor(NULL, endpoint, &ep_comp);
+        if (ep_comp) {
+          libusb_free_ss_endpoint_companion_descriptor(ep_comp);
+        }
+      }
       if(has_bulk_03 and has_bulk_84){
         int ifc = interface.altsetting[0].bInterfaceNumber;
         int alt = aid;
-        fmt::print("     - This ifc/setting is a candidate for printer control\n");
         candidates.push_back(candidate_ifc{handle, ifc, alt});
       }
     }
   }
   libusb_free_config_descriptor(conf_desc);
+
+  return candidates;
+}
+
+
+static int test_device(uint16_t vid, uint16_t pid)
+{
   
-  libusb_set_auto_detach_kernel_driver(handle, 1);
+  libusb_device_handle *handle;
+  int r;
+  
+  fmt::print("Opening device {:04X}:{:04X}...\n", vid, pid);
+  handle = libusb_open_device_with_vid_pid(NULL, vid, pid);  
+  if (handle == NULL) {
+    die("Failed to open usb device.");
+    return -1;
+  }
+
+  print_device_info(handle);  
+  auto candidates = find_candidate_interfaces(handle);
   
   if(candidates.empty()){
     fmt::print("It does not seem like the device is a compatible printer, \n");
     fmt::print("It is possible that the device is compatible but uses different endpoints than expected.");
     return 1;
   }
+  
+  libusb_set_auto_detach_kernel_driver(handle, true);
   
   auto candidate = candidates[0];
   int ret = libusb_kernel_driver_active(handle, candidate.interface);
@@ -338,10 +354,8 @@ static int test_device(uint16_t vid, uint16_t pid)
   
   
   fmt::print("\n");
-  for (iface = 0; iface<nb_ifaces; iface++) {
-    fmt::print("Releasing interface %d...\n", iface);
-    libusb_release_interface(handle, iface);
-  }
+  fmt::print("Releasing interface.\n");
+  libusb_release_interface(handle, candidate.interface);
   
   fmt::print("Closing device...\n");
   libusb_close(handle);
@@ -355,7 +369,7 @@ int main() {
   
   auto version = libusb_get_version();
   fmt::print("Using libusb v{}.{}.{}.{}\n\n", version->major, version->minor, version->micro, version->nano);
-  auto r = libusb_init(/*ctx=*/NULL);
+  auto r = libusb_init(NULL);
   if (r < 0) die("failed to initialize libusb context");
   libusb_set_option(NULL, LIBUSB_OPTION_LOG_LEVEL, LIBUSB_LOG_LEVEL_INFO);
 
